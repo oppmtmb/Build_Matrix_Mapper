@@ -1,0 +1,6 @@
+{
+  "name": "SNDK Build Matrix Mapper",
+  "description": "Converts QSI/WD Line Validation Build Matrix BOM CSVs into flat SNDK Build Matrix update CSVs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
