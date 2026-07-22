@@ -188,6 +188,150 @@ export function applyPartPrefix(partNum: string, componentType: string): string 
 }
 
 /**
+ * Helper to clean a remark string value by stripping quotes, colons, leading/trailing punctuation
+ */
+function cleanRemarkValue(str: string): string {
+  if (!str) return "";
+  let s = str.trim();
+  // Strip leading colons, semicolons, equals
+  s = s.replace(/^[;:=]\s*/, "").trim();
+  // Strip leading label headers if any
+  s = s.replace(/^(special\s*label|special\s*instructions?|remarks?|notes?)\s*[:=]?\s*/gi, "").trim();
+  // Strip leading Leg indicator (e.g. "Leg1:", "Leg 1:", "Leg1 -", "Leg2:", "L1:", "L2:")
+  s = s.replace(/^(leg\s*[123]|l[123])\s*[:=\-]?\s*/gi, "").trim();
+  // Strip trailing slashes, commas, semicolons, quotes
+  s = s.replace(/[\s\/,;]+$/, "").trim();
+  s = s.replace(/^["']|["']$/g, "").trim();
+  return s;
+}
+
+/**
+ * Extracts leg-specific remark segment from a string using regex pattern matching or line splitting.
+ * e.g., "Special label:\nLeg1: TY 32T POC1 L1-P\nLeg2: TY 32T POC1 L2-S"
+ * For legIndex=1 -> "TY 32T POC1 L1-P"
+ * For legIndex=2 -> "TY 32T POC1 L2-S"
+ */
+function extractLegSegmentFromText(text: string, legIndex: number): string | null {
+  if (!text) return null;
+
+  // Split text into lines first (in case of multi-line text in merged cell)
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  const targetKeywords = legIndex === 1
+    ? ["leg1", "leg 1", "leg-1", "l1", "primary"]
+    : ["leg2", "leg 2", "leg-2", "l2", "secondary", "leg3", "leg 3", "l3"];
+
+  // 1. Search line by line
+  for (const line of lines) {
+    const lineLower = line.toLowerCase();
+    const isTargetLine = targetKeywords.some(kw => {
+      const reg = new RegExp(`\\b${kw.replace(" ", "\\s*")}\\b|${kw}:`, 'i');
+      return reg.test(lineLower);
+    });
+
+    if (isTargetLine) {
+      const cleaned = cleanRemarkValue(line);
+      if (cleaned) return cleaned;
+    }
+  }
+
+  // 2. Search whole text with regex spanning multiple legs on a single line
+  // e.g. "Leg1: TY 32T POC1 L1-P, Leg2: TY 32T POC1 L2-S"
+  const leg1Regex = /(?:leg\s*1|l1|primary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*[23]|l[23]|secondary|$))/is;
+  const leg2Regex = /(?:leg\s*2|l2|secondary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*3|l3|$))/is;
+
+  const targetRegex = legIndex === 1 ? leg1Regex : leg2Regex;
+  const match = text.match(targetRegex);
+
+  if (match && match[1]) {
+    const cleaned = cleanRemarkValue(match[1]);
+    if (cleaned) return cleaned;
+  }
+
+  return null;
+}
+
+/**
+ * Extracts the "Special label" or "Remark" text from the header block of the CSV sheet.
+ * Leg 1 gets remark for Leg 1; Leg 2 gets remark for Leg 2.
+ * If no special label or remark is present in the sheet, it returns "" (empty string).
+ */
+export function extractSpecialLabelOrRemark(headerBlockRows: string[][], legIndex: number): string {
+  if (!headerBlockRows || headerBlockRows.length === 0) return "";
+
+  // Pass 1: Scan every cell in the header block for explicit Leg 1 / Leg 2 label matches
+  for (const row of headerBlockRows) {
+    for (const cell of row) {
+      if (!cell) continue;
+      const legSegment = extractLegSegmentFromText(cell, legIndex);
+      if (legSegment) {
+        return legSegment;
+      }
+    }
+  }
+
+  // Pass 2: Scan for "Special label" or "Remark" header cell
+  for (let r = 0; r < headerBlockRows.length; r++) {
+    const row = headerBlockRows[r];
+    for (let c = 0; c < row.length; c++) {
+      const cell = (row[c] || "").trim();
+      if (!cell) continue;
+      const cellLower = cell.toLowerCase();
+
+      if (
+        cellLower.includes("special label") ||
+        cellLower.includes("speciallabel") ||
+        cellLower.includes("special_label") ||
+        cellLower === "remark" ||
+        cellLower === "remarks" ||
+        cellLower.startsWith("remark:")
+      ) {
+        // Option A: Check subsequent cells in the SAME row (e.g. Col B for Leg 1, Col C for Leg 2)
+        const subsequentVals: string[] = [];
+        for (let nextC = c + 1; nextC < row.length; nextC++) {
+          const nextCell = (row[nextC] || "").trim();
+          if (nextCell && nextCell !== ":" && nextCell !== "=") {
+            const val = cleanRemarkValue(nextCell);
+            if (val) subsequentVals.push(val);
+          }
+        }
+
+        if (subsequentVals.length > 0) {
+          const chosen = subsequentVals[legIndex - 1] || subsequentVals[0];
+          if (chosen) return chosen;
+        }
+
+        // Option B: Check subsequent rows directly below "Special label:" header row
+        const nonPassHeaderRowsBelow: string[] = [];
+        for (let nextR = r + 1; nextR < headerBlockRows.length; nextR++) {
+          const rText = headerBlockRows[nextR].map(cell => cell.trim()).filter(Boolean).join(" ");
+          if (rText) {
+            // Check if this row below has explicit Leg indicator
+            const legSeg = extractLegSegmentFromText(rText, legIndex);
+            if (legSeg) return legSeg;
+
+            nonPassHeaderRowsBelow.push(rText);
+          }
+        }
+
+        // If rows below don't have explicit "Leg 1 / Leg 2" prefixes, use the N-th row below (N = legIndex)
+        if (nonPassHeaderRowsBelow.length >= legIndex) {
+          const targetRowText = nonPassHeaderRowsBelow[legIndex - 1];
+          const cleaned = cleanRemarkValue(targetRowText);
+          if (cleaned) return cleaned;
+        } else if (nonPassHeaderRowsBelow.length > 0) {
+          const cleaned = cleanRemarkValue(nonPassHeaderRowsBelow[0]);
+          if (cleaned && legIndex === 1) return cleaned;
+        }
+      }
+    }
+  }
+
+  // If no Special Label or Remark is found, return empty string
+  return "";
+}
+
+/**
  * Parses a Line Validation Build Matrix BOM CSV
  */
 export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: number = 1): ParsedBuild {
@@ -560,33 +704,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
   }
 
   // 6. Remark construction
-  // Remark <- PS/SS value + special-instruction text, reworded into readable form
-  // (don't copy "N/A" verbatim if a real instruction exists elsewhere)
-  const remarkParts: string[] = [];
-  if (psSs && psSs.toUpperCase() !== "N/A") {
-    let psSsExpanded = psSs;
-    if (psSs.toUpperCase() === "PS") psSsExpanded = "Primary Side (PS)";
-    if (psSs.toUpperCase() === "SS") psSsExpanded = "Secondary Side (SS)";
-    remarkParts.push(`Build Side: ${psSsExpanded}`);
-  }
-  if (dwD && dwD.toUpperCase() !== "N/A") {
-    let dwDExpanded = dwD;
-    if (dwD.toUpperCase() === "DW") dwDExpanded = "Dual Write (DW)";
-    if (dwD.toUpperCase() === "D") dwDExpanded = "Dual (D)";
-    remarkParts.push(`Mode: ${dwDExpanded}`);
-  }
-  if (soldAsCap && soldAsCap.toUpperCase() !== "N/A" && soldAsCap.toLowerCase() !== "no") {
-    remarkParts.push(`Sold as Cap: ${soldAsCap}`);
-  }
-  if (opPercent && opPercent.toUpperCase() !== "N/A") {
-    remarkParts.push(`Overprovisioning: ${opPercent}`);
-  }
-  const cleanSpecInstructions = specialInstructions.filter(inst => inst.toUpperCase() !== "N/A");
-  if (cleanSpecInstructions.length > 0) {
-    remarkParts.push(`Instructions: ${cleanSpecInstructions.join(". ")}`);
-  }
-
-  const remark = remarkParts.join(" | ");
+  const remark = extractSpecialLabelOrRemark(headerBlockRows, legIndex);
 
   // 7. Parse BOM Rows
   // Map out Column Indices from the headers array
