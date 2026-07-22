@@ -164,34 +164,6 @@ export default function App() {
       if (field === 'stage') updated.stageConfidence = 'high';
       if (field === 'ff') updated.ffConfidence = 'high';
 
-      // Re-trigger remark calculation if PS/SS or special instructions are modified
-      if (field === 'psSs' || field === 'dwD' || field === 'soldAsCap' || field === 'opPercent' || field === 'specialInstructions') {
-        const remarkParts: string[] = [];
-        if (updated.psSs && updated.psSs.toUpperCase() !== "N/A") {
-          let psSsExpanded = updated.psSs;
-          if (updated.psSs.toUpperCase() === "PS") psSsExpanded = "Primary Side (PS)";
-          if (updated.psSs.toUpperCase() === "SS") psSsExpanded = "Secondary Side (SS)";
-          remarkParts.push(`Build Side: ${psSsExpanded}`);
-        }
-        if (updated.dwD && updated.dwD.toUpperCase() !== "N/A") {
-          let dwDExpanded = updated.dwD;
-          if (updated.dwD.toUpperCase() === "DW") dwDExpanded = "Dual Write (DW)";
-          if (updated.dwD.toUpperCase() === "D") dwDExpanded = "Dual (D)";
-          remarkParts.push(`Mode: ${dwDExpanded}`);
-        }
-        if (updated.soldAsCap && updated.soldAsCap.toUpperCase() !== "N/A" && updated.soldAsCap.toLowerCase() !== "no") {
-          remarkParts.push(`Sold as Cap: ${updated.soldAsCap}`);
-        }
-        if (updated.opPercent && updated.opPercent.toUpperCase() !== "N/A") {
-          remarkParts.push(`Overprovisioning: ${updated.opPercent}`);
-        }
-        const cleanSpec = updated.specialInstructions.filter(inst => inst.toUpperCase() !== "N/A");
-        if (cleanSpec.length > 0) {
-          remarkParts.push(`Instructions: ${cleanSpec.join(". ")}`);
-        }
-        updated.remark = remarkParts.join(" | ");
-      }
-
       return updated;
     }));
   };
@@ -1105,7 +1077,7 @@ export default function App() {
                   <li><strong>WD PN:</strong> Extracted from key-value <strong>A190</strong> (leading spaces automatically stripped).</li>
                   <li><strong>Qty-1 & Qty-2:</strong> Filled with <strong>Build Qty</strong>.</li>
                   <li><strong>Capacity:</strong> Mapped from the <strong>Capacity</strong> header cell.</li>
-                  <li><strong>Remark:</strong> Constructed using PS/SS + DW/D + Overprovisioning + free-text special instructions.</li>
+                  <li><strong>Remark:</strong> Extracted directly from Special Label / Remark for each Leg (if none present, left blank).</li>
                 </ul>
               </div>
 
