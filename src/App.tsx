@@ -45,42 +45,80 @@ export default function App() {
     const newBuilds: ParsedBuild[] = [];
     let processedCount = 0;
 
+    const isValidParsedBuild = (build: ParsedBuild) => {
+      return (
+        build.bomRows.length > 0 ||
+        Boolean(build.projectName) ||
+        Boolean(build.sku) ||
+        Boolean(build.a190) ||
+        Boolean(build.a198) ||
+        Boolean(build.capacity) ||
+        Object.values(build.mappedComponents).some(val => val !== null)
+      );
+    };
+
+    const processCsvText = (csvText: string, label: string, sheetName?: string) => {
+      if (!csvText || !csvText.trim()) return;
+
+      const lowerCsv = csvText.toLowerCase();
+      const lowerSheet = (sheetName || "").toLowerCase();
+
+      const isLeg2Sheet = /leg\s*2|leg2|\bl2\b/i.test(lowerSheet) && !/leg\s*1|leg1|\bl1\b/i.test(lowerSheet);
+      const isLeg1Sheet = /leg\s*1|leg1|\bl1\b/i.test(lowerSheet) && !/leg\s*2|leg2|\bl2\b/i.test(lowerSheet);
+      const hasLeg2 = lowerCsv.includes("leg 2") || lowerCsv.includes("leg2") || lowerCsv.includes("leg 3") || lowerCsv.includes("leg3");
+
+      if (isLeg2Sheet) {
+        const parsedLeg2 = parseLVBuildMatrix(csvText, label, 2);
+        if (parsedLeg2 && isValidParsedBuild(parsedLeg2)) {
+          newBuilds.push(parsedLeg2);
+        }
+      } else if (isLeg1Sheet) {
+        const parsedLeg1 = parseLVBuildMatrix(csvText, label, 1);
+        if (parsedLeg1 && isValidParsedBuild(parsedLeg1)) {
+          newBuilds.push(parsedLeg1);
+        }
+      } else {
+        // Parse Leg 1
+        const parsedLeg1 = parseLVBuildMatrix(csvText, label, 1);
+        if (parsedLeg1 && isValidParsedBuild(parsedLeg1)) {
+          newBuilds.push(parsedLeg1);
+        }
+
+        // If spreadsheet content contains multi-leg structures, also parse Leg 2
+        if (hasLeg2) {
+          const parsedLeg2 = parseLVBuildMatrix(csvText, label, 2);
+          if (parsedLeg2 && isValidParsedBuild(parsedLeg2)) {
+            newBuilds.push(parsedLeg2);
+          }
+        }
+      }
+    };
+
     Array.from(files).forEach((file) => {
       const isCsv = file.name.toLowerCase().endsWith(".csv");
       const reader = new FileReader();
 
       reader.onload = (e) => {
         try {
-          const currentLegIndex = builds.length + newBuilds.length + 1;
-          let csvText = "";
-
           if (isCsv) {
-            csvText = e.target?.result as string;
+            const csvText = e.target?.result as string;
+            processCsvText(csvText, file.name);
           } else {
             const buffer = e.target?.result as ArrayBuffer;
             if (buffer) {
               const data = new Uint8Array(buffer);
               const workbook = XLSX.read(data, { type: "array" });
-              if (workbook.SheetNames.length > 0) {
-                const firstSheetName = workbook.SheetNames[0];
-                const worksheet = workbook.Sheets[firstSheetName];
-                csvText = XLSX.utils.sheet_to_csv(worksheet);
-              }
-            }
-          }
+              const sheetNames = workbook.SheetNames || [];
+              const isMultiSheet = sheetNames.length > 1;
 
-          if (csvText) {
-            const lowerCsv = csvText.toLowerCase();
-            const hasLeg2 = lowerCsv.includes("leg 2") || lowerCsv.includes("leg2") || lowerCsv.includes("leg 3") || lowerCsv.includes("leg3");
+              sheetNames.forEach((sheetName) => {
+                const worksheet = workbook.Sheets[sheetName];
+                if (!worksheet) return;
 
-            // Always parse Leg 1
-            const parsedLeg1 = parseLVBuildMatrix(csvText, file.name, 1);
-            newBuilds.push(parsedLeg1);
-
-            // If spreadsheet contains multi-leg structures, automatically parse and load Leg 2
-            if (hasLeg2) {
-              const parsedLeg2 = parseLVBuildMatrix(csvText, file.name, 2);
-              newBuilds.push(parsedLeg2);
+                const csvText = XLSX.utils.sheet_to_csv(worksheet);
+                const label = sheetName?.trim() || file.name;
+                processCsvText(csvText, label, sheetName);
+              });
             }
           }
         } catch (err) {
@@ -341,6 +379,14 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto p-6 space-y-8" id="app-content">
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleFileInput}
+          multiple
+          accept=".csv,.xlsx,.xls,.xlsm,.xlsb"
+          className="hidden"
+        />
         
         {/* Drag and Drop Zone / Empty State */}
         {builds.length === 0 ? (
@@ -379,15 +425,6 @@ export default function App() {
               <span className="text-[11px] font-mono text-brand-primary/40">Supports Excel (.xlsx, .xls, .xlsm, .xlsb) and stacked BOM CSV formats</span>
             </div>
 
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleFileInput}
-              multiple
-              accept=".csv,.xlsx,.xls,.xlsm,.xlsb"
-              className="hidden"
-            />
-
             {/* Quick Sample Preview Helper */}
             <div className="mt-12 pt-8 border-t border-brand-border w-full max-w-2xl text-left grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-4 rounded-xl bg-brand-surface border border-brand-border">
@@ -422,14 +459,6 @@ export default function App() {
                   >
                     + Add More
                   </button>
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handleFileInput}
-                    multiple
-                    accept=".csv"
-                    className="hidden"
-                  />
                 </div>
 
                 <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1" id="builds-list">
