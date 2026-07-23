@@ -669,12 +669,13 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
   const capacityRaw = (headerMap["capacity"] || headerMap["sold as cap"] || "").trim().replace(/^["']|["']$/g, "").trim();
   const capacity = formatAndRoundCapacity(capacityRaw);
 
-  // 4. Project Name Detection (Filename ONLY)
+  // 4. Project Name Detection (Filename / Sheet name / Header text)
   let projectName = "";
   const lowerFilename = filename.toLowerCase();
-  if (lowerFilename.includes("carrera")) {
+  const lowerCsv = csvText.toLowerCase();
+  if (lowerFilename.includes("carrera") || lowerCsv.includes("carrera")) {
     projectName = "Carrera";
-  } else if (lowerFilename.includes("enzo")) {
+  } else if (lowerFilename.includes("enzo") || lowerCsv.includes("enzo")) {
     projectName = "Enzo";
   }
 
