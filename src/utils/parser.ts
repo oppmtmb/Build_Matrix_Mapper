@@ -237,8 +237,10 @@ function extractLegSegmentFromText(text: string, legIndex: number): string | nul
 
   // 2. Search whole text with regex spanning multiple legs on a single line
   // e.g. "Leg1: TY 32T POC1 L1-P, Leg2: TY 32T POC1 L2-S"
-  const leg1Regex = /(?:leg\s*1|l1|primary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*[23]|l[23]|secondary|$))/is;
-  const leg2Regex = /(?:leg\s*2|l2|secondary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*3|l3|$))/is;
+  // (?!\d) after the leg number stops "Leg 10", "Leg 11", "Leg 23" etc. from being
+  // misread as "Leg 1"/"Leg 2" followed by a stray remark fragment ("0", "1", "3").
+  const leg1Regex = /(?:leg\s*1(?!\d)|l1(?!\d)|primary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*[23](?!\d)|l[23](?!\d)|secondary|$))/is;
+  const leg2Regex = /(?:leg\s*2(?!\d)|l2(?!\d)|secondary)\s*[:=\-]?\s*(.*?)(?=(?:leg\s*3(?!\d)|l3(?!\d)|$))/is;
 
   const targetRegex = legIndex === 1 ? leg1Regex : leg2Regex;
   const match = text.match(targetRegex);
@@ -334,6 +336,52 @@ export function extractSpecialLabelOrRemark(headerBlockRows: string[][], legInde
 /**
  * Parses a Line Validation Build Matrix BOM CSV
  */
+/**
+ * Counts how many leg columns a sheet actually has, by counting the duplicated
+ * "NPBR Qual Matrix Part#" header cells in the BOM header row (one per leg).
+ * This replaces the old text-search ("does the file contain the words 'leg 2'
+ * or 'leg 3'?") which silently dropped legs whenever a sheet's legs were
+ * numbered outside 1-3 (e.g. "Leg 4".."Leg 7").
+ */
+export function detectLegCount(csvText: string): number {
+  const parsed = Papa.parse<string[]>(csvText, { header: false, skipEmptyLines: false });
+  const rows = parsed.data;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i].map(c => (c || "").trim().toLowerCase());
+    const hasDescription = row.some(cell => cell.includes("description"));
+    const hasLoc = row.some(cell => cell.includes("loc") || cell.includes("designator"));
+    const hasPrimaryPart = row.some(cell => cell.includes("bom primary part") || cell.includes("primary part#") || cell.includes("part#"));
+    const hasQualPart = row.some(cell => cell.includes("npbr qual") || cell.includes("qual matrix"));
+
+    if (hasDescription && (hasLoc || hasPrimaryPart || hasQualPart)) {
+      const qualCount = row.filter(cell => cell.includes("npbr qual") || cell.includes("qual matrix")).length;
+      return Math.max(qualCount, 1);
+    }
+  }
+  return 1;
+}
+
+/**
+ * Finds the row in the header block that lists each leg's label (e.g.
+ * "Leg 1", "Leg 2", "Leg 3" ... "Leg 11") and returns those labels in
+ * left-to-right order. Falls back to positional "Leg N" naming if no such
+ * row is found (or if a given leg has no explicit label).
+ */
+export function detectLegLabels(csvText: string): string[] {
+  const parsed = Papa.parse<string[]>(csvText, { header: false, skipEmptyLines: false });
+  const rows = parsed.data;
+
+  let bestRow: string[] = [];
+  for (const row of rows) {
+    const legCells = row.filter(cell => /^leg\s*\d+$/i.test((cell || "").trim()));
+    if (legCells.length > bestRow.length) {
+      bestRow = legCells.map(c => c.trim().replace(/\s+/g, " "));
+    }
+  }
+  return bestRow;
+}
+
 export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: number = 1): ParsedBuild {
   const parsed = Papa.parse<string[]>(csvText, {
     header: false,
@@ -706,6 +754,8 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
 
   // 6. Remark construction
   const remark = extractSpecialLabelOrRemark(headerBlockRows, legIndex);
+  const detectedLegLabels = detectLegLabels(csvText);
+  const legNum = detectedLegLabels[legIndex - 1] || `Leg ${legIndex}`;
 
   // 7. Parse BOM Rows
   // Map out Column Indices from the headers array
@@ -728,7 +778,19 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
   const mfgPnIdx = colIndex("mfg/mfg pn", 3);
   const qtyIdx = colIndex("qty per", 4);
   const locIdx = colIndex("loc", 5);
-  const qualPartIdx = colIndex("npbr qual", 6);
+
+  // There is one "NPBR Qual Matrix Part#" column PER LEG (duplicate header text).
+  // Picking only the first occurrence (old behavior) made every leg reuse leg 1's
+  // component data. Collect every occurrence and pick the one matching this leg.
+  const qualPartIndices = headers
+    .map((h, idx) => ({ h: h.toLowerCase(), idx }))
+    .filter(({ h }) => h.includes("npbr qual") || h.includes("qual matrix"))
+    .map(({ idx }) => idx);
+  const qualPartIdx = qualPartIndices.length > 0
+    ? (qualPartIndices[legIndex - 1] !== undefined
+        ? qualPartIndices[legIndex - 1]
+        : qualPartIndices[qualPartIndices.length - 1])
+    : 6;
   
   // Find MFG P/N (the last column usually)
   let mfgPartNoIdx = headers.findIndex(h => h.toLowerCase() === "mfg p/n" || h.toLowerCase() === "mfg pn");
@@ -807,6 +869,71 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
   const timsMatched: BomRow[] = [];
   const enclosuresMatched: BomRow[] = [];
 
+  // The row's own PS/SS field tells us directly whether THIS leg is a
+  // Primary-source build or a 2nd-Source build - this is the authoritative
+  // signal for which vendor column applies, more reliable than trying to
+  // sniff a vendor name out of the qual-matrix part text (many components,
+  // e.g. Temp Sensor, carry no such embedded vendor annotation at all).
+  const psSsLower = psSs.toLowerCase();
+  const legIsPrimarySource = /primary/.test(psSsLower) && !/2nd|second/.test(psSsLower);
+  const legIsSecondSource = /2nd|second/.test(psSsLower);
+
+  // Choose which MFG / MFG P/N belongs to a given BOM row.
+  //
+  // The "MFG" / "MFG Part Number" columns at the end of the BOM header block
+  // hold only ONE vendor+part pair (columns J/K), while the BOM Primary
+  // Part# section (columns B/D) holds another. A row's actual vendor
+  // differs per leg role: Primary-source legs use the B/D vendor, 2nd-Source
+  // legs use the J/K vendor (or vice versa isn't assumed - we key off the
+  // leg's own PS/SS role). The old code always took J/K for every leg,
+  // which is why e.g. Temp Sensor showed "NXP" even for Primary-source legs
+  // that should show "TI".
+  const resolveMfgForRow = (row: BomRow): { mfg: string; mfgPn: string } => {
+    const mfg1 = (row.mfg1 || "").trim();
+    const mfg2 = (row.mfg2 || "").trim();
+    const mfgPn1 = (row.mfgMfgPn || "").trim();
+    const mfgPn2 = (row.mfgPn || "").trim();
+
+    // Not just the vendor NAME can differ between the two columns - the same
+    // vendor can supply a different part number per role too (e.g. Enclosures:
+    // both columns say "Synactic", but Primary uses "M034-003329-S" while
+    // 2nd Source uses "M034-003329-EN-S"). Route on role whenever EITHER the
+    // vendor or the part number disagrees, not just the vendor name.
+    const mfgDiffers = !!mfg1 && !!mfg2 && mfg1.toLowerCase() !== mfg2.toLowerCase();
+    const mfgPnDiffers = !!mfgPn1 && !!mfgPn2 && mfgPn1.toLowerCase() !== mfgPn2.toLowerCase();
+    const vendorsDiffer = mfgDiffers || mfgPnDiffers;
+
+    if (vendorsDiffer) {
+      if (legIsPrimarySource) return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2 };
+      if (legIsSecondSource) return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1 };
+    }
+
+    // Role unknown for this leg (blank/unrecognized PS/SS), or the two
+    // vendor columns already agree - try matching the vendor name embedded
+    // in the qual/primary part text, e.g. "...(Gultech)", as a fallback.
+    const qualText = (row.npbrQualMatrixPart || row.bomPrimaryPart || "").trim();
+    const vendorMatch = qualText.match(/\(([^)]+)\)\s*$/);
+    const embeddedVendor = vendorMatch ? vendorMatch[1].trim() : "";
+
+    if (embeddedVendor) {
+      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const ev = norm(embeddedVendor);
+      if (mfg1 && ev && (norm(mfg1) === ev || ev.includes(norm(mfg1)) || norm(mfg1).includes(ev))) {
+        return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2 };
+      }
+      if (mfg2 && ev && (norm(mfg2) === ev || ev.includes(norm(mfg2)) || norm(mfg2).includes(ev))) {
+        return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1 };
+      }
+      // A vendor is explicitly named in the source but matches neither known
+      // MFG column - don't guess which part number belongs to it.
+      return { mfg: "", mfgPn: "" };
+    }
+
+    // No role, no embedded vendor annotation - trailing column first, then
+    // primary (safe when B/D and J/K already agree, the common case).
+    return { mfg: mfg2 || mfg1, mfgPn: mfgPn2 || mfgPn1 };
+  };
+
   // Helper to register match
   const setMatch = (colName: string, row: BomRow, index: number, reason: string) => {
     row.matchedColumn = colName;
@@ -814,9 +941,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     matchedIndices.add(index);
     
     // Choose which MFG and MFG P/N to write
-    // If mfg2 / mfgPn (the NPBR Qual ones) are blank, fallback to mfg1 / mfgMfgPn
-    const finalMfg = row.mfg2.trim() || row.mfg1.trim();
-    const finalMfgPn = row.mfgPn.trim() || row.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(row);
 
     // NPBR Qual Matrix Part# is primary, with fallback to BOM Primary Part# if blank
     const sourcePart = row.npbrQualMatrixPart.trim() || row.bomPrimaryPart.trim();
@@ -1072,8 +1197,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const r = plpPmicsMatched[0];
     r.matchedColumn = "PLP+PMIC";
     r.matchReason = "Primary PLP+PMIC match";
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents["PLP+PMIC"] = {
       loc: r.loc,
@@ -1087,8 +1211,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const r = plpPmicsMatched[1];
     r.matchedColumn = "PLP+PMIC 2";
     r.matchReason = "Secondary PLP+PMIC match";
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents["PLP+PMIC 2"] = {
       loc: r.loc,
@@ -1105,8 +1228,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = polySlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `Polymer Capacitor match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1123,8 +1245,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = inductorSlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `Inductor match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1141,8 +1262,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = diodeSlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `Diode match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1159,8 +1279,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = translatorSlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `IC Translator match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1177,8 +1296,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = timSlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `TIM match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1195,8 +1313,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     const colName = enclosureSlots[idx];
     r.matchedColumn = colName;
     r.matchReason = `Enclosure match #${idx + 1}`;
-    const finalMfg = r.mfg2.trim() || r.mfg1.trim();
-    const finalMfgPn = r.mfgPn.trim() || r.mfgMfgPn.trim();
+    const { mfg: finalMfg, mfgPn: finalMfgPn } = resolveMfgForRow(r);
     const sourcePart = r.npbrQualMatrixPart.trim() || r.bomPrimaryPart.trim();
     mappedComponents[colName] = {
       loc: r.loc,
@@ -1231,7 +1348,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     soldAsCap,
     buildQty,
     specialInstructions,
-    legNum: `Leg ${legIndex}`,
+    legNum,
     remark,
     stageConfidence,
     ffConfidence,
@@ -1239,6 +1356,20 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
     bomRows,
     mappedComponents,
   };
+}
+
+/**
+ * Rewords the raw PS/SS header-block value (e.g. "(Primary Unlocked) TCG",
+ * "(2nd Source Unlocked) TCG") into plain readable text for the Remark
+ * field, per the mapping spec: Remark = PS/SS + special-instruction text.
+ * Returns "" for blank/N-A values so it doesn't pollute the Remark with a
+ * literal "N/A".
+ */
+export function formatPsSsForRemark(psSs: string): string {
+  if (!psSs) return "";
+  const trimmed = psSs.trim();
+  if (!trimmed || /^n\/?a$/i.test(trimmed)) return "";
+  return trimmed.replace(/[()]/g, "").replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -1269,13 +1400,20 @@ export function buildExportRow(build: ParsedBuild): Record<string, string> {
   row["Qty-1"] = build.buildQty;
   row["Qty-2"] = build.buildQty;
   
-  row["Remark"] = build.remark;
-  row["REMARK"] = build.remark; // Set both just in case, though column 15 is Remark, column 62 is REMARK
+  // Remark = PS/SS (Primary/2nd Source) + the free-text special instruction,
+  // per the mapping spec. build.psSs was already extracted per-leg earlier
+  // but was previously dropped here - each leg is either a Primary-source or
+  // 2nd-source build and that distinction needs to survive into the output.
+  const psSsFormatted = formatPsSsForRemark(build.psSs);
+  const combinedRemark = [psSsFormatted, build.remark].filter(Boolean).join(" — ");
+  row["Remark"] = combinedRemark;
+  row["REMARK"] = combinedRemark; // Set both just in case, though column 15 is Remark, column 62 is REMARK
 
   // WD PN <- A190 value, strip leading spaces
   if (build.a190) {
     row["WD PN"] = build.a190.trim();
   }
+
 
   // Component cell mappings
   EXPORT_HEADERS.forEach(col => {
