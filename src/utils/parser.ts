@@ -12,6 +12,7 @@ export interface BomRow {
   mfgPn: string;
   matchedColumn?: string;
   matchReason?: string;
+  allQualValues?: string[];
 }
 
 export interface MappedCell {
@@ -62,7 +63,7 @@ export const EXPORT_HEADERS = [
   "Inductor-4", "Diode-1", "Diode-2", "Diode-3", "Diode-4", "Crystal", "SPI Flash",
   "Connector", "PMIC", "IC Translator", "IC Translator2", "MUX", "Temp Sensor",
   "TIM-1", "TIM-2", "TIM-3", "TIM-4", "Enclosures-1", "Enclosures-2", "Screw", "Carton",
-  "REMARK"
+  "REMARK", "Remark 2"
 ];
 
 /**
@@ -380,6 +381,111 @@ export function detectLegLabels(csvText: string): string[] {
     }
   }
   return bestRow;
+}
+
+// Strips a trailing "(Vendor Name)" annotation off a part-number string,
+// e.g. "E007-001506-01 (Gultech)" -> "E007-001506-01".
+function stripVendorAnnotation(text: string): string {
+  return (text || "").replace(/\s*\([^)]*\)\s*$/, "").trim();
+}
+
+// A rough check for the "E009-000714" / "M034-003329" style codes used in
+// the NPBR Qual Matrix Part# / BOM Primary Part# columns, as opposed to
+// unrelated numbering schemes like "54-59-81263" that some rows (e.g. Temp
+// Sensor) put in BOM Primary Part#. Only compare-by-digits when both sides
+// look like the same kind of code - otherwise the comparison is meaningless.
+function looksLikeStandardPartCode(text: string): boolean {
+  return /^[A-Za-z]\d{2,3}-/.test((text || "").trim());
+}
+
+// Choose which MFG / MFG P/N belongs to a given BOM row, for a leg whose
+// PS/SS role (Primary-source vs 2nd-Source) is `psSs`.
+//
+// The "MFG" / "MFG Part Number" columns at the end of the BOM header block
+// hold only ONE vendor+part pair (columns J/K), while the BOM Primary
+// Part# section (columns B/D) holds another - a row's actual vendor can
+// differ per leg. There isn't one single signal that always tells us which
+// side applies, so this checks multiple signals in order of confidence:
+//
+//  1. A vendor name embedded in the qual-matrix text itself, e.g.
+//     "...(Gultech)" vs "...(Tripod Hubei)" - used only when it actually
+//     distinguishes the two columns (both sides matching, e.g. Enclosures
+//     where both say "Synactic", isn't a real signal).
+//  2. If this leg's qual-matrix value is a genuinely different part code
+//     from BOM Primary Part# (not just a suffix variant of the same base
+//     number, e.g. Enclosures' "-EN" suffix, which is signal 3's job) -
+//     an exact match to BOM Primary Part# confidently means this leg IS the
+//     primary-sourced part; a genuine mismatch confidently means it is NOT,
+//     regardless of what the leg's PS/SS label says (e.g. ePMIC's
+//     "E009-000713" is flatly not Qorvo's "E009-000714", so a leg showing
+//     713 must not be labeled with Qorvo's info even if PS/SS says
+//     "Primary"). A mismatch here is resolved by elimination (must be the
+//     other column) rather than positive proof, so it's returned flagged
+//     for manual review.
+//  3. Otherwise (uniform/suffix-related qual value across legs, e.g. Temp
+//     Sensor/Enclosures where only B/D vs J/K differ, not the qual code
+//     itself) trust the leg's own PS/SS role.
+//  4. No usable signal at all - trailing column first, then primary.
+function resolveMfgForRowByRole(row: BomRow, psSs: string): { mfg: string; mfgPn: string; flagged: boolean } {
+  const mfg1 = (row.mfg1 || "").trim();
+  const mfg2 = (row.mfg2 || "").trim();
+  const mfgPn1 = (row.mfgMfgPn || "").trim();
+  const mfgPn2 = (row.mfgPn || "").trim();
+
+  const mfgDiffers = !!mfg1 && !!mfg2 && mfg1.toLowerCase() !== mfg2.toLowerCase();
+  const mfgPnDiffers = !!mfgPn1 && !!mfgPn2 && mfgPn1.toLowerCase() !== mfgPn2.toLowerCase();
+  const vendorsDiffer = mfgDiffers || mfgPnDiffers;
+
+  if (!vendorsDiffer) {
+    // Nothing to choose between - safe default.
+    return { mfg: mfg2 || mfg1, mfgPn: mfgPn2 || mfgPn1, flagged: false };
+  }
+
+  // Signal 1: embedded vendor annotation, only if it disambiguates.
+  const qualText = (row.npbrQualMatrixPart || row.bomPrimaryPart || "").trim();
+  const vendorMatch = qualText.match(/\(([^)]+)\)\s*$/);
+  const embeddedVendor = vendorMatch ? vendorMatch[1].trim() : "";
+  if (embeddedVendor) {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const ev = norm(embeddedVendor);
+    const matchesMfg1 = !!mfg1 && (norm(mfg1) === ev || ev.includes(norm(mfg1)) || norm(mfg1).includes(ev));
+    const matchesMfg2 = !!mfg2 && (norm(mfg2) === ev || ev.includes(norm(mfg2)) || norm(mfg2).includes(ev));
+    if (matchesMfg1 && !matchesMfg2) return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2, flagged: false };
+    if (matchesMfg2 && !matchesMfg1) return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1, flagged: false };
+    // Matches both equally (e.g. "Synactic" on both sides) or neither -
+    // not a useful signal, fall through.
+  }
+
+  // Signal 2: this leg's qual value vs BOM Primary Part#, when they're
+  // genuinely different codes rather than a suffix variant of one another
+  // (a suffix variant, e.g. "M034-003329" vs "M034-003329-EN", is treated
+  // as signal 3's territory - see Enclosures).
+  const qualBase = stripVendorAnnotation(row.npbrQualMatrixPart);
+  const cBase = stripVendorAnnotation(row.bomPrimaryPart);
+  const bothStandardCodes = looksLikeStandardPartCode(qualBase) && looksLikeStandardPartCode(cBase);
+  const isSuffixVariant = bothStandardCodes && qualBase.toLowerCase() !== cBase.toLowerCase() &&
+    (qualBase.toLowerCase().startsWith(cBase.toLowerCase()) || cBase.toLowerCase().startsWith(qualBase.toLowerCase()));
+
+  if (bothStandardCodes && !isSuffixVariant) {
+    if (qualBase.toLowerCase() === cBase.toLowerCase()) {
+      // Positive match - this leg's part IS the documented primary part.
+      return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2, flagged: false };
+    }
+    // Confirmed NOT primary, but "must be the other column" is elimination,
+    // not positive proof this leg's own value truly matches K/L - flag it
+    // for a human to double check.
+    return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1, flagged: true };
+  }
+
+  // Signal 3: trust the leg's own PS/SS role.
+  const psSsLower = (psSs || "").toLowerCase();
+  const legIsPrimarySource = /primary/.test(psSsLower) && !/2nd|second/.test(psSsLower);
+  const legIsSecondSource = /2nd|second/.test(psSsLower);
+  if (legIsPrimarySource) return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2, flagged: false };
+  if (legIsSecondSource) return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1, flagged: false };
+
+  // Signal 4: no usable signal - safe default.
+  return { mfg: mfg2 || mfg1, mfgPn: mfgPn2 || mfgPn1, flagged: false };
 }
 
 export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: number = 1): ParsedBuild {
@@ -849,6 +955,7 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
       npbrQualMatrixPart: row[qualPartIdx] || "",
       mfg2: row[mfgLegIdx] || "",
       mfgPn: row[mfgPnLegIdx] || "",
+      allQualValues: qualPartIndices.map(i => row[i] || ""),
     });
   }
 
@@ -874,64 +981,18 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
   // signal for which vendor column applies, more reliable than trying to
   // sniff a vendor name out of the qual-matrix part text (many components,
   // e.g. Temp Sensor, carry no such embedded vendor annotation at all).
-  const psSsLower = psSs.toLowerCase();
-  const legIsPrimarySource = /primary/.test(psSsLower) && !/2nd|second/.test(psSsLower);
-  const legIsSecondSource = /2nd|second/.test(psSsLower);
-
-  // Choose which MFG / MFG P/N belongs to a given BOM row.
   //
-  // The "MFG" / "MFG Part Number" columns at the end of the BOM header block
-  // hold only ONE vendor+part pair (columns J/K), while the BOM Primary
-  // Part# section (columns B/D) holds another. A row's actual vendor
-  // differs per leg role: Primary-source legs use the B/D vendor, 2nd-Source
-  // legs use the J/K vendor (or vice versa isn't assumed - we key off the
-  // leg's own PS/SS role). The old code always took J/K for every leg,
-  // which is why e.g. Temp Sensor showed "NXP" even for Primary-source legs
-  // that should show "TI".
+  // When the vendor is picked by elimination (confirmed NOT the primary
+  // part, but no positive proof the trailing column is exactly right
+  // either), the MFG name is prefixed with a "⚠" marker so the sheet is
+  // easy to filter/search for manual review, rather than silently
+  // presenting an inferred value as if it were certain.
   const resolveMfgForRow = (row: BomRow): { mfg: string; mfgPn: string } => {
-    const mfg1 = (row.mfg1 || "").trim();
-    const mfg2 = (row.mfg2 || "").trim();
-    const mfgPn1 = (row.mfgMfgPn || "").trim();
-    const mfgPn2 = (row.mfgPn || "").trim();
-
-    // Not just the vendor NAME can differ between the two columns - the same
-    // vendor can supply a different part number per role too (e.g. Enclosures:
-    // both columns say "Synactic", but Primary uses "M034-003329-S" while
-    // 2nd Source uses "M034-003329-EN-S"). Route on role whenever EITHER the
-    // vendor or the part number disagrees, not just the vendor name.
-    const mfgDiffers = !!mfg1 && !!mfg2 && mfg1.toLowerCase() !== mfg2.toLowerCase();
-    const mfgPnDiffers = !!mfgPn1 && !!mfgPn2 && mfgPn1.toLowerCase() !== mfgPn2.toLowerCase();
-    const vendorsDiffer = mfgDiffers || mfgPnDiffers;
-
-    if (vendorsDiffer) {
-      if (legIsPrimarySource) return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2 };
-      if (legIsSecondSource) return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1 };
+    const result = resolveMfgForRowByRole(row, psSs);
+    if (result.flagged && result.mfg) {
+      return { mfg: `⚠VERIFY ${result.mfg}`, mfgPn: result.mfgPn };
     }
-
-    // Role unknown for this leg (blank/unrecognized PS/SS), or the two
-    // vendor columns already agree - try matching the vendor name embedded
-    // in the qual/primary part text, e.g. "...(Gultech)", as a fallback.
-    const qualText = (row.npbrQualMatrixPart || row.bomPrimaryPart || "").trim();
-    const vendorMatch = qualText.match(/\(([^)]+)\)\s*$/);
-    const embeddedVendor = vendorMatch ? vendorMatch[1].trim() : "";
-
-    if (embeddedVendor) {
-      const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
-      const ev = norm(embeddedVendor);
-      if (mfg1 && ev && (norm(mfg1) === ev || ev.includes(norm(mfg1)) || norm(mfg1).includes(ev))) {
-        return { mfg: mfg1, mfgPn: mfgPn1 || mfgPn2 };
-      }
-      if (mfg2 && ev && (norm(mfg2) === ev || ev.includes(norm(mfg2)) || norm(mfg2).includes(ev))) {
-        return { mfg: mfg2, mfgPn: mfgPn2 || mfgPn1 };
-      }
-      // A vendor is explicitly named in the source but matches neither known
-      // MFG column - don't guess which part number belongs to it.
-      return { mfg: "", mfgPn: "" };
-    }
-
-    // No role, no embedded vendor annotation - trailing column first, then
-    // primary (safe when B/D and J/K already agree, the common case).
-    return { mfg: mfg2 || mfg1, mfgPn: mfgPn2 || mfgPn1 };
+    return { mfg: result.mfg, mfgPn: result.mfgPn };
   };
 
   // Helper to register match
@@ -994,10 +1055,16 @@ export function parseLVBuildMatrix(csvText: string, filename: string, legIndex: 
       }
     }
 
-    // 5. SPI Flash (NOR FLASH MEMORY, Loc U149)
+    // 5. SPI Flash (NOR FLASH MEMORY, typically Loc U149 - but description
+    // saying "SPI Flash" outright is strong enough evidence on its own;
+    // designs vary in which Loc they place it at, e.g. this file uses U257.
     if (!matchedIndices.has(idx)) {
-      if (desigs.includes("U149") && (descLower.includes("nor") || descLower.includes("flash") || descLower.includes("spi") || descLower.includes("memory"))) {
-        setMatch("SPI Flash", row, idx, "Description matches SPI/NOR Flash and Loc matches U149");
+      if (
+        descLower.includes("spi flash") ||
+        descLower.includes("spi nor") ||
+        (desigs.includes("U149") && (descLower.includes("nor") || descLower.includes("flash") || descLower.includes("spi") || descLower.includes("memory")))
+      ) {
+        setMatch("SPI Flash", row, idx, "Description matches SPI/NOR Flash");
         return;
       }
     }
@@ -1424,6 +1491,27 @@ export function buildExportRow(build: ParsedBuild): Record<string, string> {
       row[col] = `${cell.loc}\n${cell.partNumber}\n${cell.mfg}\n${cell.mfgPn}`;
     }
   });
+
+  // Components that were found in the source BOM but have no dedicated
+  // column in this template (e.g. ePMIC, PMIC3, POL) used to be silently
+  // dropped. List them in "Remark 2" instead so nothing goes missing.
+  const unmatchedRows = (build.bomRows || []).filter(
+    r => !r.matchedColumn && (r.description || "").trim()
+  );
+  if (unmatchedRows.length > 0) {
+    const parts = unmatchedRows.map(r => {
+      const qualText = (r.npbrQualMatrixPart || r.bomPrimaryPart || "").trim();
+      const cleanQual = qualText.replace(/\s*\([^)]*\)\s*$/, "").trim();
+      const partNum = applyPartPrefix(cleanQual, "");
+      const resolved = resolveMfgForRowByRole(r, build.psSs);
+      const mfg = resolved.flagged && resolved.mfg ? `⚠VERIFY ${resolved.mfg}` : resolved.mfg;
+      const mfgPn = resolved.mfgPn;
+      const desc = (r.description || "").trim();
+      const vendorBit = mfg ? ` (${mfg}${mfgPn ? " " + mfgPn : ""})` : "";
+      return `${desc}: ${partNum}${vendorBit}`;
+    });
+    row["Remark 2"] = parts.join(" | ");
+  }
 
   // Apply user-defined cell overrides if any
   if (build.overrides) {
